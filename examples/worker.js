@@ -31,5 +31,5 @@ const { PriorityLockQueue } = require('../dist');
     queue.stopWorker();
   });
 
-  await queue.startWorker(handler, { maxAttempts: 2, batchSize: 1 });
+  await queue.startWorker(handler, { maxAttempts: 2, batchSize: 20, concurrency: Number(process.env.CONCURRENCY || 5) });
 })();

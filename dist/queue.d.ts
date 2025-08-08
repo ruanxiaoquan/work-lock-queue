@@ -42,6 +42,7 @@ export declare class PriorityLockQueue {
         maxAttempts?: number;
         renewIntervalMs?: number;
         batchSize?: number;
+        concurrency?: number;
     }): Promise<void>;
     stopWorker(): void;
     private safeParse;
