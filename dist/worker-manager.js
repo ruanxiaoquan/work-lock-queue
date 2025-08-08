@@ -142,9 +142,26 @@ class QueueWorkerManager extends events_1.EventEmitter {
             queue,
             stopped: false,
         });
+        // 组装针对该命名空间的有效 worker 配置
+        const baseWorkerOptions = { ...(this.options.workerOptions || {}) };
+        const cw = baseWorkerOptions.concurrency;
+        let effectiveConcurrency;
+        if (cw && typeof cw === 'object') {
+            const mapped = cw[namespace];
+            if (Number.isFinite(mapped)) {
+                effectiveConcurrency = Math.max(1, Math.floor(mapped));
+            }
+            else {
+                effectiveConcurrency = 5; // 默认并发
+            }
+        }
+        else {
+            effectiveConcurrency = 5; // 未配置则默认 5
+        }
+        baseWorkerOptions.concurrency = effectiveConcurrency;
         // 不等待主循环（避免阻塞）
         queue
-            .startWorker(handler, this.options.workerOptions)
+            .startWorker(handler, baseWorkerOptions)
             .catch((err) => this.options.log?.error(`[worker:${namespace}] loop error`, err))
             .finally(() => {
             // 主循环退出后，从运行表中移除

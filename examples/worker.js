@@ -30,7 +30,8 @@ const { QueueWorkerManager } = require('../dist');
   // - 监听控制通道 `queue:worker:control` 的 start/stop/rescan 事件。
   await manager.start(handler, {
     redisClient,
-    workerOptions: { maxAttempts: 2, batchSize: 20, concurrency: Number(process.env.CONCURRENCY || 5) },
+    // 可按命名空间配置并发；未配置的命名空间默认 5
+    workerOptions: { maxAttempts: 2, batchSize: 20, concurrency: { [process.env.QUEUE_NAMESPACE || 'demo']: Number(process.env.CONCURRENCY || 5) } },
     queueOptions: { lockTtlMs: 15000, idleSleepMs: 300 },
     scanIntervalMs: Number(process.env.SCAN_INTERVAL_MS || 10000),
     controlChannel: process.env.CONTROL_CHANNEL || 'queue:worker:control',
