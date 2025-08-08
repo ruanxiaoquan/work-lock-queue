@@ -1,15 +1,15 @@
 import type { RedisClientType } from 'redis';
-type ConsoleLike = {
-    error: (...args: any[]) => void;
-    warn: (...args: any[]) => void;
-    log: (...args: any[]) => void;
-};
+export declare enum TaskPriority {
+    DEFAULT = 1,
+    MEDIUM = 2,
+    HIGH = 3
+}
 export interface PriorityLockQueueOptions {
     redisClient: RedisClientType<any, any, any>;
     namespace?: string;
     lockTtlMs?: number;
     idleSleepMs?: number;
-    log?: ConsoleLike;
+    log?: Console;
 }
 export interface EnqueuedTaskMeta {
     id: string;
@@ -33,7 +33,14 @@ export declare class PriorityLockQueue {
     disconnect(): Promise<void>;
     static computeScore(priority: number, nowMs: number): number;
     private taskKey;
-    enqueueTask(payload: unknown, priority?: number): Promise<string>;
+    getNamespace(): string;
+    getMetrics(): Promise<{
+        namespace: string;
+        pendingCount: number;
+        processingCount: number;
+        failedCount: number;
+    }>;
+    enqueueTask(payload: unknown, priority: TaskPriority.DEFAULT): Promise<string>;
     private acquireLock;
     private renewLock;
     private releaseLock;
@@ -48,4 +55,3 @@ export declare class PriorityLockQueue {
     private safeParse;
     private serializeError;
 }
-export {};
