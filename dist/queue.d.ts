@@ -100,6 +100,7 @@ export declare class PriorityLockQueue {
         pendingCount: number;
         processingCount: number;
         failedCount: number;
+        succeededCount: number;
     }>;
     /**
      * 入队一个任务。

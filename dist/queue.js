@@ -93,16 +93,18 @@ class PriorityLockQueue {
      * 获取队列当前指标（pending/processing/failed 数量）。
      */
     async getMetrics() {
-        const [pendingCount, processingCount, failedCount] = (await Promise.all([
+        const [pendingCount, processingCount, failedCount, succeededCount] = (await Promise.all([
             this.client.zCard(this.keys.pending),
             this.client.hLen(this.keys.processing),
             this.client.lLen(this.keys.failed),
+            this.client.lLen(this.keys.succeeded),
         ]));
         return {
             namespace: this.namespace,
             pendingCount: Number(pendingCount || 0),
             processingCount: Number(processingCount || 0),
             failedCount: Number(failedCount || 0),
+            succeededCount: Number(succeededCount || 0),
         };
     }
     /**

@@ -179,18 +179,21 @@ export class PriorityLockQueue {
     pendingCount: number;
     processingCount: number;
     failedCount: number;
+    succeededCount: number;
   }> {
-    const [pendingCount, processingCount, failedCount] = (await Promise.all([
+    const [pendingCount, processingCount, failedCount, succeededCount] = (await Promise.all([
       this.client.zCard(this.keys.pending),
       this.client.hLen(this.keys.processing),
       this.client.lLen(this.keys.failed),
-    ])) as unknown as [number, number, number];
+      this.client.lLen(this.keys.succeeded),
+    ])) as unknown as [number, number, number, number];
 
     return {
       namespace: this.namespace,
       pendingCount: Number(pendingCount || 0),
       processingCount: Number(processingCount || 0),
       failedCount: Number(failedCount || 0),
+      succeededCount: Number(succeededCount || 0),
     };
   }
 

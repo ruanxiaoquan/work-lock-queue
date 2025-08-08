@@ -40,16 +40,18 @@ app.get('/metrics', async (req, res) => {
 
     const results = [];
     for (const ns of namespaces) {
-      const [pendingCount, processingCount, failedCount] = await Promise.all([
+      const [pendingCount, processingCount, failedCount, succeededCount] = await Promise.all([
         redisClient.zCard(`${ns}:pending`),
         redisClient.hLen(`${ns}:processing`),
         redisClient.lLen(`${ns}:failed`),
+        redisClient.lLen(`${ns}:succeeded`),
       ]);
       results.push({
         namespace: ns,
         pendingCount: Number(pendingCount || 0),
         processingCount: Number(processingCount || 0), // 当前并发占用（运行中任务数）
         failedCount: Number(failedCount || 0),
+        succeededCount: Number(succeededCount || 0),
       });
     }
 
@@ -65,16 +67,18 @@ app.get('/metrics/:namespaces', async (req, res) => {
   try {
     const results = [];
     for (const ns of list) {
-      const [pendingCount, processingCount, failedCount] = await Promise.all([
+      const [pendingCount, processingCount, failedCount, succeededCount] = await Promise.all([
         redisClient.zCard(`${ns}:pending`),
         redisClient.hLen(`${ns}:processing`),
         redisClient.lLen(`${ns}:failed`),
+        redisClient.lLen(`${ns}:succeeded`),
       ]);
       results.push({
         namespace: ns,
         pendingCount: Number(pendingCount || 0),
         processingCount: Number(processingCount || 0),
         failedCount: Number(failedCount || 0),
+        succeededCount: Number(succeededCount || 0),
       });
     }
     res.json({ metrics: results });
@@ -93,6 +97,8 @@ app.get(['/observe', '/observe/:namespaces'], async (req, res) => {
       namespaces = String(req.params.namespaces).split(',').filter(Boolean);
     } else if (req.query.namespaces) {
       namespaces = String(req.query.namespaces).split(',').filter(Boolean);
+    } else if (req.query.namespace) {
+      namespaces = [String(req.query.namespace)];
     } else {
       // 若未指定，则自动发现
       const discovered = new Set();
@@ -127,16 +133,20 @@ app.get(['/observe', '/observe/:namespaces'], async (req, res) => {
       // 失败列表
       const failedRaw = await redisClient.lRange(`${ns}:failed`, 0, limit - 1);
       const failed = failedRaw.map((s) => safeParse(s));
+      const failedCount = Number(await redisClient.lLen(`${ns}:failed`));
 
       // 成功列表
       const succeededRaw = await redisClient.lRange(`${ns}:succeeded`, 0, limit - 1);
       const succeeded = succeededRaw.map((s) => safeParse(s));
+      const succeededCount = Number(await redisClient.lLen(`${ns}:succeeded`));
 
       results.push({
         namespace: ns,
         running,
         failed,
         succeeded,
+        failedCount,
+        succeededCount,
       });
     }
 
