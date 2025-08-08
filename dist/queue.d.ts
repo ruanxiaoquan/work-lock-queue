@@ -61,6 +61,8 @@ export declare class PriorityLockQueue {
     private readonly idleSleepMs;
     /** 日志对象 */
     private readonly log;
+    /** 本实例唯一 workerId，用于区分归属，避免自我回收 */
+    private readonly workerId;
     /** 标记是否请求停止 worker 循环 */
     private workerAbort;
     /** 当前持有锁时保存的随机值（用于续约/释放校验） */
@@ -123,6 +125,15 @@ export declare class PriorityLockQueue {
      */
     private releaseLock;
     /**
+     * 原子弹出并标记 processing，避免进程崩溃导致任务丢失。
+     */
+    private popAndMarkProcessing;
+    /**
+     * 回收超时卡死的 processing 任务（visibility timeout）。
+     * 超过 processingStaleMs 未完成的任务将被重新放回 pending。
+     */
+    private reclaimStaleProcessing;
+    /**
      * Promise 版 sleep，worker 空转时使用以避免热循环。
      */
     private sleep;
@@ -142,6 +153,8 @@ export declare class PriorityLockQueue {
         batchSize?: number;
         /** 单轮最大并发执行数，默认 1 */
         concurrency?: number;
+        /** 处理超时时间（毫秒）。超过则认为任务卡死并回滚到待处理，默认 2*lockTtlMs */
+        processingStaleMs?: number;
     }): Promise<void>;
     /**
      * 请求停止 worker（安全停止：会在当前循环点生效）。

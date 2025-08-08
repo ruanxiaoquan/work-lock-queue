@@ -200,17 +200,31 @@ class QueueWorkerManager extends events_1.EventEmitter {
         }
     }
     /**
-     * 从 Redis 扫描命名空间（基于 *:pending）。
+     * 从 Redis 扫描命名空间（基于 *:pending 以及 processing/failed/succeeded）。
      */
     async discoverNamespaces() {
         if (!this.redisClient)
             throw new Error('QueueWorkerManager not initialized: redisClient missing');
         const discovered = new Set();
-        for await (const key of this.redisClient.scanIterator({ MATCH: '*:pending', COUNT: 200 })) {
-            const ns = String(key).replace(/:pending$/, '');
-            if (ns)
-                discovered.add(ns);
-        }
+        const addFromPattern = async (pattern) => {
+            for await (const key of this.redisClient.scanIterator({ MATCH: pattern, COUNT: 200 })) {
+                const k = String(key);
+                if (k.endsWith(':pending'))
+                    discovered.add(k.replace(/:pending$/, ''));
+                else if (k.endsWith(':processing'))
+                    discovered.add(k.replace(/:processing$/, ''));
+                else if (k.endsWith(':failed'))
+                    discovered.add(k.replace(/:failed$/, ''));
+                else if (k.endsWith(':succeeded'))
+                    discovered.add(k.replace(/:succeeded$/, ''));
+            }
+        };
+        await Promise.all([
+            addFromPattern('*:pending'),
+            addFromPattern('*:processing'),
+            addFromPattern('*:failed'),
+            addFromPattern('*:succeeded'),
+        ]);
         return Array.from(discovered);
     }
     /**
