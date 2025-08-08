@@ -8,7 +8,7 @@ export interface QueueWorkerManagerOptions {
   workerOptions?: {
     maxAttempts?: number;
     batchSize?: number;
-    concurrency?: number;
+    concurrency?: Record<string, number>;
     renewIntervalMs?: number;
   };
   /** 每个命名空间队列的 lockTtl/idlesleep 配置（传入 PriorityLockQueue） */
@@ -209,9 +209,25 @@ export class QueueWorkerManager extends EventEmitter {
       stopped: false,
     });
 
+    // 组装针对该命名空间的有效 worker 配置
+    const baseWorkerOptions = { ...(this.options.workerOptions || {}) } as any;
+    const cw = baseWorkerOptions.concurrency as Record<string, number> | undefined;
+    let effectiveConcurrency: number;
+    if (cw && typeof cw === 'object') {
+      const mapped = cw[namespace];
+      if (Number.isFinite(mapped as number)) {
+        effectiveConcurrency = Math.max(1, Math.floor(mapped as number));
+      } else {
+        effectiveConcurrency = 5; // 默认并发
+      }
+    } else {
+      effectiveConcurrency = 5; // 未配置则默认 5
+    }
+    baseWorkerOptions.concurrency = effectiveConcurrency;
+
     // 不等待主循环（避免阻塞）
     queue
-      .startWorker(handler, this.options.workerOptions)
+      .startWorker(handler, baseWorkerOptions)
       .catch((err) => this.options.log?.error(`[worker:${namespace}] loop error`, err))
       .finally(() => {
         // 主循环退出后，从运行表中移除
