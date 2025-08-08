@@ -82,8 +82,8 @@ Worker 主循环：
 
 ## 观测与排障
 
-- 指标：`GET /metrics` 或 `GET /metrics/:namespaces`（示例 API）
-- 观测：`GET /observe` 或 `GET /observe/:namespaces?limit=100`
+- 指标：`GET /metrics` 或 `GET /metrics/:namespaces`（示例 API，含 pending/processing/failed/succeeded 数量）
+- 观测：`GET /observe` 或 `GET /observe/:namespaces?limit=100`，也可使用 `?namespace=ns` 单个过滤
 - 运行中：`namespace:processing`（HASH）
 - 失败记录：`namespace:failed`（LIST）
 - 成功记录：`namespace:succeeded`（LIST）
