@@ -1,7 +1,13 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PriorityLockQueue = void 0;
+exports.PriorityLockQueue = exports.TaskPriority = void 0;
 const uuid_1 = require("uuid");
+var TaskPriority;
+(function (TaskPriority) {
+    TaskPriority[TaskPriority["DEFAULT"] = 1] = "DEFAULT";
+    TaskPriority[TaskPriority["MEDIUM"] = 2] = "MEDIUM";
+    TaskPriority[TaskPriority["HIGH"] = 3] = "HIGH";
+})(TaskPriority || (exports.TaskPriority = TaskPriority = {}));
 class PriorityLockQueue {
     constructor(options) {
         const { redisClient, namespace = 'queue', lockTtlMs = 30000, idleSleepMs = 500, log = console, } = options;
@@ -45,7 +51,25 @@ class PriorityLockQueue {
     taskKey(taskId) {
         return `${this.namespace}:task:${taskId}`;
     }
-    async enqueueTask(payload, priority = 5) {
+    // Expose current namespace
+    getNamespace() {
+        return this.namespace;
+    }
+    // Fetch queue metrics for this namespace
+    async getMetrics() {
+        const [pendingCount, processingCount, failedCount] = (await Promise.all([
+            this.client.zCard(this.keys.pending),
+            this.client.hLen(this.keys.processing),
+            this.client.lLen(this.keys.failed),
+        ]));
+        return {
+            namespace: this.namespace,
+            pendingCount: Number(pendingCount || 0),
+            processingCount: Number(processingCount || 0),
+            failedCount: Number(failedCount || 0),
+        };
+    }
+    async enqueueTask(payload, priority) {
         await this.connect();
         const taskId = (0, uuid_1.v4)();
         const createdAtMs = Date.now();

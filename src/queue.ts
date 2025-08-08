@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { TairRedisClient } from '@ali/midway-tair-redis';
+import type { RedisClientType } from 'redis';
 
 export enum TaskPriority {
   DEFAULT = 1,
@@ -8,10 +8,11 @@ export enum TaskPriority {
 }
 
 export interface PriorityLockQueueOptions {
-  redisClient: TairRedisClient;
+  redisClient: RedisClientType<any, any, any>;
   namespace?: string;
   lockTtlMs?: number;
   idleSleepMs?: number;
+  log?: Console;
 }
 
 export interface EnqueuedTaskMeta {
@@ -23,7 +24,7 @@ export interface EnqueuedTaskMeta {
 }
 
 export class PriorityLockQueue {
-  private readonly client: TairRedisClient;
+  private readonly client: RedisClientType<any, any, any>;
   private readonly namespace: string;
   private readonly keys: {
     pending: string;
@@ -33,9 +34,11 @@ export class PriorityLockQueue {
   };
   private readonly lockTtlMs: number;
   private readonly idleSleepMs: number;
+  private readonly log: Console;
 
   private workerAbort: boolean;
   private currentLockValue: string | null;
+  private didConnectInternally: boolean;
 
   constructor(options: PriorityLockQueueOptions) {
     const {
@@ -43,6 +46,7 @@ export class PriorityLockQueue {
       namespace = 'queue',
       lockTtlMs = 30000,
       idleSleepMs = 500,
+      log = console,
     } = options;
 
     this.client = redisClient;
@@ -56,15 +60,31 @@ export class PriorityLockQueue {
 
     this.lockTtlMs = lockTtlMs;
     this.idleSleepMs = idleSleepMs;
+    this.log = log;
 
     const clientAsAny = this.client as any;
     if (clientAsAny && typeof clientAsAny.on === 'function') {
       clientAsAny.on('error', (err: unknown) =>
-        console.log('[redis] client error', err)
+        this.log.error('[redis] client error', err)
       );
     }
     this.workerAbort = false;
     this.currentLockValue = null;
+    this.didConnectInternally = false;
+  }
+
+  async connect(): Promise<void> {
+    if (!(this.client as any).isOpen) {
+      await this.client.connect();
+      this.didConnectInternally = true;
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.didConnectInternally) {
+      await this.client.quit();
+      this.didConnectInternally = false;
+    }
   }
 
   static computeScore(priority: number, nowMs: number): number {
@@ -81,10 +101,37 @@ export class PriorityLockQueue {
     return `${this.namespace}:task:${taskId}`;
   }
 
+  // Expose current namespace
+  public getNamespace(): string {
+    return this.namespace;
+  }
+
+  // Fetch queue metrics for this namespace
+  public async getMetrics(): Promise<{
+    namespace: string;
+    pendingCount: number;
+    processingCount: number;
+    failedCount: number;
+  }> {
+    const [pendingCount, processingCount, failedCount] = (await Promise.all([
+      this.client.zCard(this.keys.pending),
+      this.client.hLen(this.keys.processing),
+      this.client.lLen(this.keys.failed),
+    ])) as unknown as [number, number, number];
+
+    return {
+      namespace: this.namespace,
+      pendingCount: Number(pendingCount || 0),
+      processingCount: Number(processingCount || 0),
+      failedCount: Number(failedCount || 0),
+    };
+  }
+
   async enqueueTask(
     payload: unknown,
     priority: TaskPriority.DEFAULT
   ): Promise<string> {
+    await this.connect();
     const taskId = uuidv4();
     const createdAtMs = Date.now();
     const score = PriorityLockQueue.computeScore(priority, createdAtMs);
@@ -95,15 +142,15 @@ export class PriorityLockQueue {
     const taskHashKey = this.taskKey(taskId);
 
     const multi = this.client.multi();
-    multi.hset(taskHashKey, {
+    (multi as any).hSet(taskHashKey, {
       id: taskId,
       payload: payloadString,
       priority: String(priority),
       createdAtMs: String(createdAtMs),
       attempts: '0',
-    } as any);
-    multi.zadd(this.keys.pending, score, taskId);
-    multi.expire(taskHashKey, 7 * 24 * 60 * 60);
+    });
+    (multi as any).zAdd(this.keys.pending, [{ score, value: taskId }]);
+    (multi as any).expire(taskHashKey, 7 * 24 * 60 * 60);
 
     await multi.exec();
     return taskId;
@@ -169,6 +216,7 @@ export class PriorityLockQueue {
       concurrency?: number;
     } = {}
   ): Promise<void> {
+    await this.connect();
     const {
       maxAttempts = 3,
       renewIntervalMs = Math.max(1000, Math.floor(this.lockTtlMs / 3)),
@@ -184,7 +232,7 @@ export class PriorityLockQueue {
           try {
             await this.renewLock();
           } catch (err) {
-            console.log('[lock] renew failed', err);
+            this.log.warn('[lock] renew failed', err);
           }
         }
         await this.sleep(renewIntervalMs);
@@ -198,7 +246,7 @@ export class PriorityLockQueue {
       try {
         hasLock = await this.acquireLock();
       } catch (err) {
-        console.log('[lock] acquire error', err);
+        this.log.error('[lock] acquire error', err);
       }
 
       if (!hasLock) {
@@ -212,12 +260,12 @@ export class PriorityLockQueue {
 
         const startNextIfAny = async () => {
           // Pop one task and start processing if available
-          const popped = (await this.client.zpopmin(this.keys.pending)) as any;
+          const popped = (await (this.client as any).zPopMin(this.keys.pending)) as any;
           if (!popped) return false;
           const raw = Array.isArray(popped) ? popped[0] : popped;
           const taskId = typeof raw === 'string' ? raw : raw.value;
           const taskKey = this.taskKey(taskId);
-          const taskData = await this.client.hgetall(taskKey);
+          const taskData = await (this.client as any).hGetAll(taskKey);
           if (!taskData || !(taskData as any).id) {
             return true; // consider as consumed; try to continue
           }
@@ -230,7 +278,7 @@ export class PriorityLockQueue {
             attempts: Number((taskData as any).attempts || 0),
           };
 
-          await this.client.hset(
+          await (this.client as any).hSet(
             this.keys.processing,
             taskId,
             String(Date.now())
@@ -240,12 +288,12 @@ export class PriorityLockQueue {
             try {
               await handler(deserialized);
               const multi = this.client.multi();
-              multi.hdel(this.keys.processing, taskId);
-              multi.del(taskKey);
+              (multi as any).hDel(this.keys.processing, taskId);
+              (multi as any).del(taskKey);
               await multi.exec();
             } catch (err) {
               deserialized.attempts += 1;
-              await this.client.hset(
+              await (this.client as any).hSet(
                 taskKey,
                 'attempts',
                 String(deserialized.attempts)
@@ -267,21 +315,23 @@ export class PriorityLockQueue {
                   deserialized.createdAtMs
                 );
                 const multi = this.client.multi();
-                multi.lpush(this.keys.failed, failureRecord);
-                multi.zadd(this.keys.pending, score, deserialized.id);
-                multi.hdel(this.keys.processing, taskId);
+                (multi as any).lPush(this.keys.failed, failureRecord);
+                (multi as any).zAdd(this.keys.pending, [
+                  { score, value: deserialized.id },
+                ]);
+                (multi as any).hDel(this.keys.processing, taskId);
                 await multi.exec();
               } else {
                 const multi = this.client.multi();
-                multi.lpush(this.keys.failed, failureRecord);
-                multi.hdel(this.keys.processing, taskId);
+                (multi as any).lPush(this.keys.failed, failureRecord);
+                (multi as any).hDel(this.keys.processing, taskId);
                 await multi.exec();
               }
             }
           })()
             .catch((err) => {
               // Should not happen due to try/catch inside, but guard just in case
-              console.log('[worker] unhandled task error', err);
+              this.log.error('[worker] unhandled task error', err as any);
             })
             .finally(() => {
               inflight.delete(p);
