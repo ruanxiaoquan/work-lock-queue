@@ -64,7 +64,7 @@ export class PriorityLockQueue {
     pending: string;
     /** 失败列表（LIST） */
     failed: string;
-    /** 正在处理中的任务（HASH，taskId -> startedAtMs） */
+    /** 正在处理中的任务（HASH，taskId -> startedMeta(JSON)） */
     processing: string;
     /** 分布式锁 key */
     lock: string;
@@ -77,6 +77,8 @@ export class PriorityLockQueue {
   private readonly idleSleepMs: number;
   /** 日志对象 */
   private readonly log: Console;
+  /** 本实例唯一 workerId，用于区分归属，避免自我回收 */
+  private readonly workerId: string = uuidv4();
 
   /** 标记是否请求停止 worker 循环 */
   private workerAbort: boolean;
@@ -291,6 +293,112 @@ export class PriorityLockQueue {
   }
 
   /**
+   * 原子弹出并标记 processing，避免进程崩溃导致任务丢失。
+   */
+  private async popAndMarkProcessing(): Promise<string | null> {
+    const script = `
+      local popped = redis.call('ZPOPMIN', KEYS[1])
+      if (not popped or #popped == 0) then
+        return nil
+      end
+      local taskId = popped[1]
+      redis.call('HSET', KEYS[2], taskId, ARGV[1])
+      return taskId
+    `;
+    const startedMeta = JSON.stringify({ startedAtMs: Date.now(), workerId: this.workerId });
+    const result = await this.client.eval(script, {
+      keys: [this.keys.pending, this.keys.processing],
+      arguments: [startedMeta],
+    } as any);
+    if (!result) return null;
+    return String(result);
+  }
+
+  /**
+   * 回收超时卡死的 processing 任务（visibility timeout）。
+   * 超过 processingStaleMs 未完成的任务将被重新放回 pending。
+   */
+  private async reclaimStaleProcessing(processingStaleMs: number, maxAttempts: number): Promise<void> {
+    try {
+      const processingEntries = await (this.client as any).hGetAll(this.keys.processing);
+      const now = Date.now();
+      for (const [taskId, startedMetaStr] of Object.entries(processingEntries || {})) {
+        let startedAtMs = 0;
+        let ownerWorkerId: string | null = null;
+        if (typeof startedMetaStr === 'string') {
+          try {
+            const meta = JSON.parse(startedMetaStr);
+            startedAtMs = Number(meta?.startedAtMs || 0);
+            ownerWorkerId = typeof meta?.workerId === 'string' ? meta.workerId : null;
+          } catch {
+            // 兼容旧值（纯数字）
+            startedAtMs = Number(startedMetaStr || 0);
+          }
+        }
+        // 不回收当前实例仍在处理的任务
+        if (ownerWorkerId && ownerWorkerId === this.workerId) continue;
+        if (startedAtMs > 0 && now - startedAtMs > processingStaleMs) {
+          const taskKey = this.taskKey(taskId);
+          const taskData = await (this.client as any).hGetAll(taskKey);
+          if (taskData && (taskData as any).id) {
+            const deserialized: EnqueuedTaskMeta = {
+              id: (taskData as any).id,
+              payload: this.safeParse((taskData as any).payload),
+              priority: Number((taskData as any).priority || 5),
+              createdAtMs: Number((taskData as any).createdAtMs || Date.now()),
+              attempts: Number((taskData as any).attempts || 0),
+            };
+
+            // 将可见性超时视为一次失败尝试
+            deserialized.attempts += 1;
+            await (this.client as any).hSet(taskKey, 'attempts', String(deserialized.attempts));
+
+            const failureRecord = JSON.stringify({
+              id: deserialized.id,
+              payload: deserialized.payload,
+              priority: deserialized.priority,
+              createdAtMs: deserialized.createdAtMs,
+              failedAtMs: now,
+              attempts: deserialized.attempts,
+              error: { name: 'StaleProcessingTimeout', message: 'processing visibility timeout' },
+            });
+
+            if (deserialized.attempts < maxAttempts) {
+              const score = PriorityLockQueue.computeScore(
+                deserialized.priority,
+                deserialized.createdAtMs
+              );
+              const multi = this.client.multi();
+              (multi as any).lPush(this.keys.failed, failureRecord);
+              (multi as any).zAdd(this.keys.pending, [{ score, value: deserialized.id }]);
+              (multi as any).hDel(this.keys.processing, taskId);
+              await multi.exec();
+              this.log.warn(
+                `[worker:${this.namespace}] reclaimed stale task`,
+                { taskId: deserialized.id, startedAtMs, now, processingStaleMs, ownerWorkerId }
+              );
+            } else {
+              const multi = this.client.multi();
+              (multi as any).lPush(this.keys.failed, failureRecord);
+              (multi as any).hDel(this.keys.processing, taskId);
+              await multi.exec();
+              this.log.warn(
+                `[worker:${this.namespace}] dropped stale task after maxAttempts`,
+                { taskId: deserialized.id, startedAtMs, now, processingStaleMs, attempts: deserialized.attempts, ownerWorkerId }
+              );
+            }
+          } else {
+            // 无元数据，直接清理 processing 标记
+            await (this.client as any).hDel(this.keys.processing, taskId);
+          }
+        }
+      }
+    } catch (err) {
+      this.log.warn('[worker] reclaim stale processing error', err);
+    }
+  }
+
+  /**
    * Promise 版 sleep，worker 空转时使用以避免热循环。
    */
   private async sleep(ms: number): Promise<void> {
@@ -315,6 +423,8 @@ export class PriorityLockQueue {
       batchSize?: number;
       /** 单轮最大并发执行数，默认 1 */
       concurrency?: number;
+      /** 处理超时时间（毫秒）。超过则认为任务卡死并回滚到待处理，默认 2*lockTtlMs */
+      processingStaleMs?: number;
     } = {}
   ): Promise<void> {
     await this.connect();
@@ -323,6 +433,7 @@ export class PriorityLockQueue {
       renewIntervalMs = Math.max(1000, Math.floor(this.lockTtlMs / 3)),
       batchSize = 1,
       concurrency = 1,
+      processingStaleMs = this.lockTtlMs * 2,
     } = options;
 
     this.workerAbort = false;
@@ -357,19 +468,23 @@ export class PriorityLockQueue {
       }
 
       try {
+        // 回收卡死的 processing 任务，避免因为实例崩溃而永久丢失
+        await this.reclaimStaleProcessing(processingStaleMs, maxAttempts);
+
         let startedCount = 0;
         const inflight = new Set<Promise<void>>();
 
         // 拉取并启动下一个任务（若有）
         const startNextIfAny = async () => {
-          // 从 ZSET 弹出一个最小 score 的任务
-          const popped = (await (this.client as any).zPopMin(this.keys.pending)) as any;
-          if (!popped) return false;
-          const raw = Array.isArray(popped) ? popped[0] : popped;
-          const taskId = typeof raw === 'string' ? raw : raw.value;
+          // 原子弹出 + 标记 processing
+          const taskId = await this.popAndMarkProcessing();
+          if (!taskId) return false;
+
           const taskKey = this.taskKey(taskId);
           const taskData = await (this.client as any).hGetAll(taskKey);
           if (!taskData || !(taskData as any).id) {
+            // 任务元数据不存在，清理 processing 标记并继续
+            await (this.client as any).hDel(this.keys.processing, taskId);
             return true; // 视为已消费，尝试继续
           }
 
@@ -381,25 +496,27 @@ export class PriorityLockQueue {
             attempts: Number((taskData as any).attempts || 0),
           };
 
-          // 标记为正在处理
-          await (this.client as any).hSet(
-            this.keys.processing,
-            taskId,
-            String(Date.now())
-          );
-
           const p = (async () => {
             try {
               await handler(deserialized);
               // 成功：记录成功信息并清理元数据
-              const startedAtMsStr = await (this.client as any).hGet(this.keys.processing, taskId);
+              const startedMetaStr = await (this.client as any).hGet(this.keys.processing, taskId);
+              let startedAtMsParsed = Date.now();
+              if (typeof startedMetaStr === 'string') {
+                try {
+                  const meta = JSON.parse(startedMetaStr);
+                  startedAtMsParsed = Number(meta?.startedAtMs || startedAtMsParsed);
+                } catch {
+                  startedAtMsParsed = Number(startedMetaStr || startedAtMsParsed);
+                }
+              }
               const succeededAtMs = Date.now();
               const successRecord = JSON.stringify({
                 id: deserialized.id,
                 payload: deserialized.payload,
                 priority: deserialized.priority,
                 createdAtMs: deserialized.createdAtMs,
-                startedAtMs: Number(startedAtMsStr || succeededAtMs),
+                startedAtMs: Number(startedAtMsParsed || succeededAtMs),
                 succeededAtMs,
                 attempts: deserialized.attempts,
               });

@@ -73,7 +73,7 @@ export declare class QueueWorkerManager extends EventEmitter {
      */
     discoverAndStartAll(handler: (task: EnqueuedTaskMeta) => Promise<void>): Promise<void>;
     /**
-     * 从 Redis 扫描命名空间（基于 *:pending）。
+     * 从 Redis 扫描命名空间（基于 *:pending 以及 processing/failed/succeeded）。
      */
     discoverNamespaces(): Promise<string[]>;
     /**

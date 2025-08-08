@@ -106,12 +106,13 @@ Worker 主循环：
 
 ## 重要说明与参数
 
-`startWorker(handler, { concurrency, batchSize, maxAttempts, renewIntervalMs })`
+`startWorker(handler, { concurrency, batchSize, maxAttempts, renewIntervalMs, processingStaleMs })`
 
 - **concurrency**：配置为 `{ [namespace: string]: number }`。未指定的命名空间默认并发为 5（推荐确保 `batchSize >= concurrency`）。
 - **batchSize**：单轮最多拉取的任务数（默认 1），应 ≥ `concurrency` 以充分利用并发
 - **maxAttempts**：最大重试次数（不含首次，默认 3）
 - **renewIntervalMs**：锁续约间隔（默认 `max(1000, lockTtlMs/3)`）
+- **processingStaleMs**：处理可见性超时（默认 `2 * lockTtlMs`）。超时未完成的任务会从 `processing` 回收并重新放回 `pending`，容忍实例崩溃/网络分区。
 
 `PriorityLockQueue` 构造参数：
 
