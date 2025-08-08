@@ -170,7 +170,7 @@ export class PriorityLockQueue {
 
   async startWorker(
     handler: (task: EnqueuedTaskMeta) => Promise<void>,
-    options: { maxAttempts?: number; renewIntervalMs?: number; batchSize?: number } = {}
+    options: { maxAttempts?: number; renewIntervalMs?: number; batchSize?: number; concurrency?: number } = {}
   ): Promise<void> {
     await this.connect();
 
@@ -178,6 +178,7 @@ export class PriorityLockQueue {
       maxAttempts = 3,
       renewIntervalMs = Math.max(1000, Math.floor(this.lockTtlMs / 3)),
       batchSize = 1,
+      concurrency = 1,
     } = options;
 
     this.workerAbort = false;
@@ -211,17 +212,21 @@ export class PriorityLockQueue {
       }
 
       try {
-        for (let i = 0; i < batchSize; i++) {
+        let startedCount = 0;
+        const inflight = new Set<Promise<void>>();
+
+        const startNextIfAny = async () => {
+          // Pop one task and start processing if available
           const popped = (await this.client.zPopMin(this.keys.pending)) as any;
           if (!popped || popped.length === 0) {
-            break;
+            return false;
           }
 
           const taskId = (popped[0].value ?? popped[0]) as string;
           const taskKey = this.taskKey(taskId);
           const taskData = await this.client.hGetAll(taskKey);
           if (!taskData || !(taskData as any).id) {
-            continue;
+            return true; // consider as consumed; try to continue
           }
 
           const deserialized: EnqueuedTaskMeta = {
@@ -234,39 +239,70 @@ export class PriorityLockQueue {
 
           await this.client.hSet(this.keys.processing, taskId, String(Date.now()));
 
-          try {
-            await handler(deserialized);
-            const multi = this.client.multi();
-            multi.hDel(this.keys.processing, taskId);
-            multi.del(taskKey);
-            await multi.exec();
-          } catch (err) {
-            deserialized.attempts += 1;
-            await this.client.hSet(taskKey, 'attempts', String(deserialized.attempts));
+          const p = (async () => {
+            try {
+              await handler(deserialized);
+              const multi = this.client.multi();
+              multi.hDel(this.keys.processing, taskId);
+              multi.del(taskKey);
+              await multi.exec();
+            } catch (err) {
+              deserialized.attempts += 1;
+              await this.client.hSet(taskKey, 'attempts', String(deserialized.attempts));
 
-            const failureRecord = JSON.stringify({
-              id: deserialized.id,
-              payload: deserialized.payload,
-              priority: deserialized.priority,
-              createdAtMs: deserialized.createdAtMs,
-              failedAtMs: Date.now(),
-              attempts: deserialized.attempts,
-              error: this.serializeError(err as any),
+              const failureRecord = JSON.stringify({
+                id: deserialized.id,
+                payload: deserialized.payload,
+                priority: deserialized.priority,
+                createdAtMs: deserialized.createdAtMs,
+                failedAtMs: Date.now(),
+                attempts: deserialized.attempts,
+                error: this.serializeError(err as any),
+              });
+
+              if (deserialized.attempts < maxAttempts) {
+                const score = PriorityLockQueue.computeScore(deserialized.priority, deserialized.createdAtMs);
+                const multi = this.client.multi();
+                multi.lPush(this.keys.failed, failureRecord);
+                multi.zAdd(this.keys.pending, [{ score, value: deserialized.id }]);
+                multi.hDel(this.keys.processing, taskId);
+                await multi.exec();
+              } else {
+                const multi = this.client.multi();
+                multi.lPush(this.keys.failed, failureRecord);
+                multi.hDel(this.keys.processing, taskId);
+                await multi.exec();
+              }
+            }
+          })()
+            .catch((err) => {
+              // Should not happen due to try/catch inside, but guard just in case
+              this.log.error('[worker] unhandled task error', err);
+            })
+            .finally(() => {
+              inflight.delete(p);
             });
 
-            if (deserialized.attempts < maxAttempts) {
-              const score = PriorityLockQueue.computeScore(deserialized.priority, deserialized.createdAtMs);
-              const multi = this.client.multi();
-              multi.lPush(this.keys.failed, failureRecord);
-              multi.zAdd(this.keys.pending, [{ score, value: deserialized.id }]);
-              multi.hDel(this.keys.processing, taskId);
-              await multi.exec();
-            } else {
-              const multi = this.client.multi();
-              multi.lPush(this.keys.failed, failureRecord);
-              multi.hDel(this.keys.processing, taskId);
-              await multi.exec();
-            }
+          inflight.add(p);
+          startedCount += 1;
+          return true;
+        };
+
+        // Fill up initial concurrency window
+        while (!this.workerAbort && inflight.size < concurrency && startedCount < batchSize) {
+          const didStart = await startNextIfAny();
+          if (!didStart) break;
+        }
+
+        // While there are still tasks running, as each finishes, try to start next until batchSize reached
+        while (!this.workerAbort && inflight.size > 0) {
+          // Wait for any one to settle
+          await Promise.race(Array.from(inflight));
+
+          // Refill slots
+          while (!this.workerAbort && inflight.size < concurrency && startedCount < batchSize) {
+            const didStart = await startNextIfAny();
+            if (!didStart) break;
           }
         }
       } finally {
