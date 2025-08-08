@@ -40,6 +40,47 @@ CONCURRENCY=5 npm run start:worker
 - `REDIS_URL`（默认 `redis://localhost:6379`）
 - `QUEUE_NAMESPACE`（默认 `demo`）
 
+## Worker 管理器（自动发现命名空间 + 事件驱动启动）
+
+引入 `QueueWorkerManager` 单例，自动识别当前所有命名空间（基于 `*:pending` 扫描），为每个命名空间自动实例化并启动 worker 主循环；并通过 Redis Pub/Sub 监听控制事件以按需启动/停止，避免重复监听与重复启动。
+
+示例（见 `examples/worker.js`）：
+
+```js
+const { createClient } = require('redis');
+const { QueueWorkerManager } = require('./dist');
+
+(async () => {
+  const redisClient = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+  await redisClient.connect();
+
+  async function handler(task) {
+    // 处理任务...
+  }
+
+  const manager = QueueWorkerManager.getInstance();
+  await manager.start(handler, {
+    redisClient,
+    workerOptions: { maxAttempts: 2, batchSize: 20, concurrency: 5 },
+    queueOptions: { lockTtlMs: 15000, idleSleepMs: 300 },
+    scanIntervalMs: 10000, // 周期性重扫，发现新命名空间
+    controlChannel: 'queue:worker:control',
+  });
+})();
+```
+
+控制通道（Pub/Sub）消息格式：
+
+- 启动指定命名空间：`{"action":"start","namespace":"ns1"}`
+- 停止指定命名空间：`{"action":"stop","namespace":"ns1"}`
+- 触发重新扫描：`{"action":"rescan"}`
+
+发布示例（redis-cli）：
+
+```bash
+redis-cli PUBLISH queue:worker:control '{"action":"start","namespace":"demo"}'
+```
+
 ## 工作原理
 
 - 待处理队列：`namespace:pending`（ZSET）。score = `priority * 1e12 + createdAtMs`，分数越小越先出队

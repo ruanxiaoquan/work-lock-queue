@@ -18,4 +18,5 @@ Object.defineProperty(exports, "__esModule", { value: true });
  * 导出队列核心实现（PriorityLockQueue 等）。
  */
 __exportStar(require("./queue"), exports);
+__exportStar(require("./worker-manager"), exports);
 //# sourceMappingURL=index.js.map
