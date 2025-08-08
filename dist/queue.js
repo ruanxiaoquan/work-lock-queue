@@ -18,6 +18,7 @@ class PriorityLockQueue {
             failed: `${namespace}:failed`,
             processing: `${namespace}:processing`,
             lock: `${namespace}:lock`,
+            succeeded: `${namespace}:succeeded`,
         };
         this.lockTtlMs = lockTtlMs;
         this.idleSleepMs = idleSleepMs;
@@ -194,7 +195,20 @@ class PriorityLockQueue {
                     const p = (async () => {
                         try {
                             await handler(deserialized);
+                            // On success, record to succeeded list with timing, then cleanup
+                            const startedAtMsStr = await this.client.hGet(this.keys.processing, taskId);
+                            const succeededAtMs = Date.now();
+                            const successRecord = JSON.stringify({
+                                id: deserialized.id,
+                                payload: deserialized.payload,
+                                priority: deserialized.priority,
+                                createdAtMs: deserialized.createdAtMs,
+                                startedAtMs: Number(startedAtMsStr || succeededAtMs),
+                                succeededAtMs,
+                                attempts: deserialized.attempts,
+                            });
                             const multi = this.client.multi();
+                            multi.lPush(this.keys.succeeded, successRecord);
                             multi.hDel(this.keys.processing, taskId);
                             multi.del(taskKey);
                             await multi.exec();
