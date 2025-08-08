@@ -1,46 +1,94 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { RedisClientType } from 'redis';
 
+/**
+ * 任务优先级枚举（数字越小，优先级越高）。
+ * 建议范围：0（最高）~ 1000（最低）。
+ */
 export enum TaskPriority {
+  /** 默认优先级（1），高于 MEDIUM/HIGH 的语义仅作示例，数字越小越先处理 */
   DEFAULT = 1,
+  /** 中等优先级（2） */
   MEDIUM = 2,
+  /** 较高优先级（3），注意数值越小优先级越高，0 最高 */
   HIGH = 3,
 }
 
+/**
+ * 队列构造参数。
+ */
 export interface PriorityLockQueueOptions {
+  /** Redis 客户端实例（已由外部创建/管理） */
   redisClient: RedisClientType<any, any, any>;
+  /** 命名空间，用作所有 Redis key 的前缀，默认 'queue' */
   namespace?: string;
+  /** 分布式锁 TTL（毫秒），默认 30000ms。必须大于续约间隔 */
   lockTtlMs?: number;
+  /** 空转等待时长（毫秒），用于无锁或无任务时的短暂休眠，默认 500ms */
   idleSleepMs?: number;
+  /** 日志对象，默认 console */
   log?: Console;
 }
 
+/**
+ * 入队任务的元数据（存储在 Redis HASH 中）。
+ */
 export interface EnqueuedTaskMeta {
+  /** 任务 ID（UUID） */
   id: string;
+  /** 任务载荷（用户自定义，JSON 序列化存储） */
   payload: unknown;
+  /** 优先级（数字越小优先级越高） */
   priority: number;
+  /** 入队时间戳（毫秒） */
   createdAtMs: number;
+  /** 已尝试执行次数 */
   attempts: number;
 }
 
+/**
+ * 基于 Redis 的带优先级、分布式锁的队列。
+ * - 仅持有锁的 worker 才能批量拉取并处理任务；
+ * - 优先级越高（数字越小）越先被处理；
+ * - 失败任务会被记录到失败列表，并按配置重试；
+ * - 提供基本指标与观测支持（processing/failed/succeeded）。
+ */
 export class PriorityLockQueue {
+  /** Redis 客户端 */
   private readonly client: RedisClientType<any, any, any>;
+  /** 队列命名空间（Redis key 前缀） */
   private readonly namespace: string;
+  /** 各类 Redis key */
   private readonly keys: {
+    /** 等待队列（ZSET），score 越小越先出队 */
     pending: string;
+    /** 失败列表（LIST） */
     failed: string;
+    /** 正在处理中的任务（HASH，taskId -> startedAtMs） */
     processing: string;
+    /** 分布式锁 key */
     lock: string;
+    /** 成功列表（LIST），存储成功记录 */
     succeeded: string;
   };
+  /** 锁的 TTL（毫秒） */
   private readonly lockTtlMs: number;
+  /** 空闲睡眠时长（毫秒） */
   private readonly idleSleepMs: number;
+  /** 日志对象 */
   private readonly log: Console;
 
+  /** 标记是否请求停止 worker 循环 */
   private workerAbort: boolean;
+  /** 当前持有锁时保存的随机值（用于续约/释放校验） */
   private currentLockValue: string | null;
+  /** 标记 connect() 是否在内部调用（用于决定 disconnect 行为） */
   private didConnectInternally: boolean;
 
+  /**
+   * 构造函数。
+   * @param options 配置项（见 PriorityLockQueueOptions）
+   */
   constructor(options: PriorityLockQueueOptions) {
     const {
       redisClient,
@@ -64,6 +112,7 @@ export class PriorityLockQueue {
     this.idleSleepMs = idleSleepMs;
     this.log = log;
 
+    // 监听 Redis 客户端错误，便于排查问题
     const clientAsAny = this.client as any;
     if (clientAsAny && typeof clientAsAny.on === 'function') {
       clientAsAny.on('error', (err: unknown) =>
@@ -75,6 +124,10 @@ export class PriorityLockQueue {
     this.didConnectInternally = false;
   }
 
+  /**
+   * 确保 Redis 已连接。
+   * - 如果外部尚未连接，则在此连接，并记录内部连接标记
+   */
   async connect(): Promise<void> {
     if (!(this.client as any).isOpen) {
       await this.client.connect();
@@ -82,6 +135,9 @@ export class PriorityLockQueue {
     }
   }
 
+  /**
+   * 关闭 Redis 连接（仅当 connect() 是内部打开时）。
+   */
   async disconnect(): Promise<void> {
     if (this.didConnectInternally) {
       await this.client.quit();
@@ -89,6 +145,10 @@ export class PriorityLockQueue {
     }
   }
 
+  /**
+   * 计算任务的排序分数（score）。
+   * 分数 = priority * 1e12 + nowMs，数值越小越先被处理。
+   */
   static computeScore(priority: number, nowMs: number): number {
     const numericPriority = Number.isFinite(priority) ? Number(priority) : 5;
     const safePriority = Math.max(
@@ -99,16 +159,21 @@ export class PriorityLockQueue {
     return safePriority * PRIORITY_SCALE + nowMs;
   }
 
+  /**
+   * 获取任务在 Redis 中的 HASH key。
+   */
   private taskKey(taskId: string): string {
     return `${this.namespace}:task:${taskId}`;
   }
 
-  // Expose current namespace
+  /** 暴露当前命名空间 */
   public getNamespace(): string {
     return this.namespace;
   }
 
-  // Fetch queue metrics for this namespace
+  /**
+   * 获取队列当前指标（pending/processing/failed 数量）。
+   */
   public async getMetrics(): Promise<{
     namespace: string;
     pendingCount: number;
@@ -129,6 +194,12 @@ export class PriorityLockQueue {
     };
   }
 
+  /**
+   * 入队一个任务。
+   * @param payload 任务载荷（对象将被 JSON 序列化存储）
+   * @param priority 优先级（数字越小越高），默认 TaskPriority.DEFAULT
+   * @returns 任务 ID
+   */
   async enqueueTask(
     payload: unknown,
     priority: TaskPriority.DEFAULT
@@ -143,6 +214,7 @@ export class PriorityLockQueue {
 
     const taskHashKey = this.taskKey(taskId);
 
+    // 事务：写入任务 HASH、加入待处理 ZSET、设置过期
     const multi = this.client.multi();
     (multi as any).hSet(taskHashKey, {
       id: taskId,
@@ -158,6 +230,10 @@ export class PriorityLockQueue {
     return taskId;
   }
 
+  /**
+   * 尝试获取分布式锁（SET NX PX）。
+   * 成功返回 true，并记录当前锁值用于续约/释放。
+   */
   private async acquireLock(): Promise<boolean> {
     const lockValue = uuidv4();
     const ok = await this.client.set(this.keys.lock, lockValue, {
@@ -171,6 +247,9 @@ export class PriorityLockQueue {
     return false;
   }
 
+  /**
+   * 续约分布式锁（Lua 校验锁值一致后 pexpire）。
+   */
   private async renewLock(): Promise<boolean> {
     if (!this.currentLockValue) return false;
     const script = `
@@ -187,6 +266,9 @@ export class PriorityLockQueue {
     return Number(result) === 1;
   }
 
+  /**
+   * 释放分布式锁（Lua 校验锁值一致后 del）。
+   */
   private async releaseLock(): Promise<boolean> {
     if (!this.currentLockValue) return false;
     const script = `
@@ -205,16 +287,30 @@ export class PriorityLockQueue {
     return released;
   }
 
+  /**
+   * Promise 版 sleep，worker 空转时使用以避免热循环。
+   */
   private async sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  /**
+   * 启动 worker 主循环。
+   * - 仅持有锁的实例会拉取任务；
+   * - 每轮最多拉取 batchSize 个任务，且最多并发 concurrency 个执行；
+   * - 失败按 maxAttempts 控制是否重试，失败记录写入失败列表；
+   * - 期间后台协程按 renewIntervalMs 定期续约锁。
+   */
   async startWorker(
     handler: (task: EnqueuedTaskMeta) => Promise<void>,
     options: {
+      /** 最大重试次数（不含首次执行），默认 3 */
       maxAttempts?: number;
+      /** 锁续约间隔（毫秒），默认 max(1000, lockTtlMs/3) */
       renewIntervalMs?: number;
+      /** 每轮最多拉取的任务数（应 >= concurrency 以充分并发），默认 1 */
       batchSize?: number;
+      /** 单轮最大并发执行数，默认 1 */
       concurrency?: number;
     } = {}
   ): Promise<void> {
@@ -228,6 +324,7 @@ export class PriorityLockQueue {
 
     this.workerAbort = false;
 
+    // 后台锁续约协程
     const renewer = async () => {
       while (!this.workerAbort) {
         if (this.currentLockValue) {
@@ -260,8 +357,9 @@ export class PriorityLockQueue {
         let startedCount = 0;
         const inflight = new Set<Promise<void>>();
 
+        // 拉取并启动下一个任务（若有）
         const startNextIfAny = async () => {
-          // Pop one task and start processing if available
+          // 从 ZSET 弹出一个最小 score 的任务
           const popped = (await (this.client as any).zPopMin(this.keys.pending)) as any;
           if (!popped) return false;
           const raw = Array.isArray(popped) ? popped[0] : popped;
@@ -269,7 +367,7 @@ export class PriorityLockQueue {
           const taskKey = this.taskKey(taskId);
           const taskData = await (this.client as any).hGetAll(taskKey);
           if (!taskData || !(taskData as any).id) {
-            return true; // consider as consumed; try to continue
+            return true; // 视为已消费，尝试继续
           }
 
           const deserialized: EnqueuedTaskMeta = {
@@ -280,6 +378,7 @@ export class PriorityLockQueue {
             attempts: Number((taskData as any).attempts || 0),
           };
 
+          // 标记为正在处理
           await (this.client as any).hSet(
             this.keys.processing,
             taskId,
@@ -289,7 +388,7 @@ export class PriorityLockQueue {
           const p = (async () => {
             try {
               await handler(deserialized);
-              // On success, record to succeeded list with timing, then cleanup
+              // 成功：记录成功信息并清理元数据
               const startedAtMsStr = await (this.client as any).hGet(this.keys.processing, taskId);
               const succeededAtMs = Date.now();
               const successRecord = JSON.stringify({
@@ -307,6 +406,7 @@ export class PriorityLockQueue {
               (multi as any).del(taskKey);
               await multi.exec();
             } catch (err) {
+              // 失败：增加尝试次数并根据策略重试或仅记录
               deserialized.attempts += 1;
               await (this.client as any).hSet(
                 taskKey,
@@ -345,7 +445,7 @@ export class PriorityLockQueue {
             }
           })()
             .catch((err) => {
-              // Should not happen due to try/catch inside, but guard just in case
+              // 理论上不会触发（已在 try/catch 内处理），兜底日志
               this.log.error('[worker] unhandled task error', err as any);
             })
             .finally(() => {
@@ -357,7 +457,7 @@ export class PriorityLockQueue {
           return true;
         };
 
-        // Fill up initial concurrency window
+        // 先填满并发窗口
         while (
           !this.workerAbort &&
           inflight.size < concurrency &&
@@ -367,12 +467,12 @@ export class PriorityLockQueue {
           if (!didStart) break;
         }
 
-        // While there are still tasks running, as each finishes, try to start next until batchSize reached
+        // 等待并在空槽出现时继续拉取直至达到 batchSize
         while (!this.workerAbort && inflight.size > 0) {
-          // Wait for any one to settle
+          // 等任意一个任务完成
           await Promise.race(Array.from(inflight));
 
-          // Refill slots
+          // 继续补充任务
           while (
             !this.workerAbort &&
             inflight.size < concurrency &&
@@ -390,10 +490,14 @@ export class PriorityLockQueue {
     }
   }
 
+  /**
+   * 请求停止 worker（安全停止：会在当前循环点生效）。
+   */
   stopWorker(): void {
     this.workerAbort = true;
   }
 
+  /** 安全 JSON 解析：失败时返回原字符串 */
   private safeParse(str: unknown): unknown {
     if (typeof str !== 'string') return str;
     try {
@@ -403,6 +507,7 @@ export class PriorityLockQueue {
     }
   }
 
+  /** 将错误对象序列化为可 JSON 化的结构 */
   private serializeError(err: unknown): Record<string, unknown> {
     if (!err) return { message: 'Unknown error' };
     if (err instanceof Error) {
