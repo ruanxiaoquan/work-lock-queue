@@ -61,7 +61,7 @@ const { QueueWorkerManager } = require('./dist');
   const manager = QueueWorkerManager.getInstance();
   await manager.start(handler, {
     redisClient,
-    workerOptions: { maxAttempts: 2, batchSize: 20, concurrency: 5 },
+    workerOptions: { maxAttempts: 2, batchSize: 20, concurrency: { demo: 5 } },
     queueOptions: { lockTtlMs: 15000, idleSleepMs: 300 },
     scanIntervalMs: 10000, // 周期性重扫，发现新命名空间
     controlChannel: 'queue:worker:control',
@@ -108,7 +108,7 @@ Worker 主循环：
 
 `startWorker(handler, { concurrency, batchSize, maxAttempts, renewIntervalMs })`
 
-- **concurrency**：单轮最大并发数（默认 1）
+- **concurrency**：配置为 `{ [namespace: string]: number }`。未指定的命名空间默认并发为 5（推荐确保 `batchSize >= concurrency`）。
 - **batchSize**：单轮最多拉取的任务数（默认 1），应 ≥ `concurrency` 以充分利用并发
 - **maxAttempts**：最大重试次数（不含首次，默认 3）
 - **renewIntervalMs**：锁续约间隔（默认 `max(1000, lockTtlMs/3)`）

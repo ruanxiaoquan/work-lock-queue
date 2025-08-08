@@ -7,7 +7,7 @@ export interface QueueWorkerManagerOptions {
     workerOptions?: {
         maxAttempts?: number;
         batchSize?: number;
-        concurrency?: number;
+        concurrency?: Record<string, number>;
         renewIntervalMs?: number;
     };
     /** 每个命名空间队列的 lockTtl/idlesleep 配置（传入 PriorityLockQueue） */
