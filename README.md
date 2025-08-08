@@ -1,76 +1,95 @@
-# Redis Priority Lock Queue (Node.js)
+# Redis 优先级锁队列（Node.js）
 
-Redis-backed queue that ensures only one worker processes tasks at a time across instances via a preemptive distributed lock. Tasks are queued with priority and failures are sent to a failure list.
+一个基于 Redis 的队列，实现“分布式锁 + 优先级 + 失败处理”。通过抢占式分布式锁保证同一时刻只有一台实例批量拉取任务；任务按优先级（数值越小优先级越高）入队与调度；失败任务会记录到失败列表并按配置进行重试。
 
-- Single producer API: `enqueueTask(payload, priority)` enqueues tasks to a run queue
-- Worker processes tasks across the cluster using a Redis lock with configurable concurrency per worker
-- On failure, tasks are logged to a failure queue and retried up to `maxAttempts`
-- Priority: lower numeric priority is higher (0 highest)
+- **单一生产者 API**：`enqueueTask(payload, priority)` 将任务入队（按优先级排序）
+- **Worker 并发**：通过分布式锁控制实例间互斥，每轮在持锁窗口内按 `concurrency` 并发处理
+- **失败处理**：失败会写入失败列表，并在未超过 `maxAttempts` 时重新入队
+- **优先级说明**：数字越小优先级越高（0 最高），同优先级按入队时间 FIFO
 
-## Install
+## 安装
 
 ```bash
 npm install
 ```
 
-Set `REDIS_URL` if not on localhost.
+如不是本机 Redis，请设置环境变量 `REDIS_URL`。
 
-## Usage
+## 用法
 
-Enqueue tasks:
+入队任务示例：
 
 ```js
 const { PriorityLockQueue } = require('./src');
 
 (async () => {
-  const queue = new PriorityLockQueue({ namespace: 'jobs', redisUrl: process.env.REDIS_URL });
-  await queue.enqueueTask({ userId: 123 }, 0); // highest priority
-  await queue.enqueueTask({ userId: 456 }, 5); // normal priority
+  const queue = new PriorityLockQueue({ namespace: 'jobs', redisClient /* 传入 redis 客户端 */ });
+  await queue.enqueueTask({ userId: 123 }, 0); // 最高优先级
+  await queue.enqueueTask({ userId: 456 }, 5); // 普通优先级
 })();
 ```
 
-Run worker:
+运行 worker：
 
 ```bash
 CONCURRENCY=5 npm run start:worker
 ```
 
-Environment:
+环境变量：
 
-- `REDIS_URL` (default `redis://localhost:6379`)
-- `QUEUE_NAMESPACE` (default `demo`)
+- `REDIS_URL`（默认 `redis://localhost:6379`）
+- `QUEUE_NAMESPACE`（默认 `demo`）
 
-## How it works
+## 工作原理
 
-- Pending queue: `namespace:pending` (ZSET). Score = `priority * 1e12 + createdAtMs` so lower score pops first
-- Task metadata: `namespace:task:{id}` (HASH)
-- Failure queue: `namespace:failed` (LIST)
-- Lock: `namespace:lock` with `SET NX PX` and safe renew/release using Lua
+- 待处理队列：`namespace:pending`（ZSET）。score = `priority * 1e12 + createdAtMs`，分数越小越先出队
+- 任务元信息：`namespace:task:{id}`（HASH）
+- 失败队列：`namespace:failed`（LIST）
+- 成功队列：`namespace:succeeded`（LIST）
+- 分布式锁：`namespace:lock`，通过 `SET NX PX` 获取，Lua 脚本安全续约与释放
 
-Worker loop:
+Worker 主循环：
 
-1. Acquire lock
-2. Pop up to `batchSize` tasks, running at most `concurrency` at a time
-3. Run handler(s)
-4. On success: delete task metadata
-5. On failure: push record to `failed` list and optionally requeue until `maxAttempts`
-6. Release lock after all started tasks finish
+1. 获取分布式锁
+2. 从待处理队列拉取至多 `batchSize` 个任务，并以最多 `concurrency` 并发处理
+3. 执行用户提供的 `handler`
+4. 成功：记录到成功列表并清理任务元信息
+5. 失败：记录到失败列表，若未超过 `maxAttempts` 则重新入队
+6. 当前轮结束后释放锁；若无任务则短暂休眠，避免热循环
 
-## Example
+## 示例
 
-- Enqueue demo tasks: `npm run start:demo`
-- Start worker: `npm run start:worker`
+- 入队演示：`npm run start:demo`
+- 启动 worker：`npm run start:worker`
+- 启动 API：`npm run start:api`
 
-## Notes
+## 重要说明与参数
 
-- Priority: 0 is highest. Tasks within the same priority are FIFO by enqueue time
-- Lock TTL is renewed in the background while processing
-- If there are no tasks, the worker releases the lock and sleeps briefly to avoid hot looping
+`startWorker(handler, { concurrency, batchSize, maxAttempts, renewIntervalMs })`
 
-## Concurrency
+- **concurrency**：单轮最大并发数（默认 1）
+- **batchSize**：单轮最多拉取的任务数（默认 1），应 ≥ `concurrency` 以充分利用并发
+- **maxAttempts**：最大重试次数（不含首次，默认 3）
+- **renewIntervalMs**：锁续约间隔（默认 `max(1000, lockTtlMs/3)`）
 
-`startWorker(handler, { concurrency, batchSize, maxAttempts })`
+`PriorityLockQueue` 构造参数：
 
-- `concurrency`: maximum number of tasks processed in parallel in one lock window (default 1)
-- `batchSize`: upper bound of tasks pulled per iteration (default 1). It should be >= `concurrency` to fully utilize parallelism
-- Example: `CONCURRENCY=10 npm run start:worker`
+- **redisClient**：Redis 客户端（必填）
+- **namespace**：命名空间前缀（默认 `queue`）
+- **lockTtlMs**：锁过期时间（毫秒，默认 `30000`）
+- **idleSleepMs**：无锁/无任务时的休眠（毫秒，默认 `500`）
+- **log**：日志对象，默认 `console`
+
+## 观测与排障
+
+- 指标：`GET /metrics` 或 `GET /metrics/:namespaces`（示例 API）
+- 观测：`GET /observe` 或 `GET /observe/:namespaces?limit=100`
+- 运行中：`namespace:processing`（HASH）
+- 失败记录：`namespace:failed`（LIST）
+- 成功记录：`namespace:succeeded`（LIST）
+
+## 备注
+
+- 优先级数值越小越先执行（0 最高）。同一优先级下按入队时间先后执行（FIFO）
+- 锁会在处理期间后台持续续约，避免长任务期间锁过期
+- 建议 `batchSize >= concurrency`，否则并发无法完全利用

@@ -1,18 +1,33 @@
 {
+  // TypeScript 编译器选项
   "compilerOptions": {
+    // 目标 JavaScript 版本（决定输出 JS 的语法特性）
     "target": "ES2020",
+    // 使用的模块系统（Node.js 常用 CommonJS）
     "module": "CommonJS",
+    // 编译后输出目录
     "outDir": "dist",
+    // 源码所在根目录
     "rootDir": "src",
+    // 是否启用严格类型检查（建议开启）
     "strict": true,
+    // 允许默认导入 CommonJS 模块（与很多 npm 包更好兼容）
     "esModuleInterop": true,
+    // 强制文件名大小写保持一致（跨平台更安全）
     "forceConsistentCasingInFileNames": true,
+    // 跳过 .d.ts 类型声明文件检查（加快编译速度）
     "skipLibCheck": true,
+    // 生成 .d.ts 类型声明文件（便于被其他项目引用）
     "declaration": true,
+    // 生成 source map（便于调试映射到 TS 源码）
     "sourceMap": true,
+    // 指定编译目标所需的内置库（ES2020 能力与 DOM API）
     "lib": ["ES2020", "DOM"],
+    // 指定模块解析策略（Node 风格解析）
     "moduleResolution": "Node"
   },
+  // 参与编译的文件匹配规则
   "include": ["src/**/*"],
+  // 从编译中排除的目录
   "exclude": ["node_modules", "dist"]
 }
