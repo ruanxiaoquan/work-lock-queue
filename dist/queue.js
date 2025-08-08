@@ -150,10 +150,10 @@ class PriorityLockQueue {
                 const startNextIfAny = async () => {
                     // Pop one task and start processing if available
                     const popped = (await this.client.zPopMin(this.keys.pending));
-                    if (!popped || popped.length === 0) {
+                    if (!popped)
                         return false;
-                    }
-                    const taskId = (popped[0].value ?? popped[0]);
+                    const raw = Array.isArray(popped) ? popped[0] : popped;
+                    const taskId = typeof raw === 'string' ? raw : raw.value;
                     const taskKey = this.taskKey(taskId);
                     const taskData = await this.client.hGetAll(taskKey);
                     if (!taskData || !taskData.id) {
@@ -191,7 +191,9 @@ class PriorityLockQueue {
                                 const score = PriorityLockQueue.computeScore(deserialized.priority, deserialized.createdAtMs);
                                 const multi = this.client.multi();
                                 multi.lPush(this.keys.failed, failureRecord);
-                                multi.zAdd(this.keys.pending, [{ score, value: deserialized.id }]);
+                                multi.zAdd(this.keys.pending, [
+                                    { score, value: deserialized.id },
+                                ]);
                                 multi.hDel(this.keys.processing, taskId);
                                 await multi.exec();
                             }
@@ -215,7 +217,9 @@ class PriorityLockQueue {
                     return true;
                 };
                 // Fill up initial concurrency window
-                while (!this.workerAbort && inflight.size < concurrency && startedCount < batchSize) {
+                while (!this.workerAbort &&
+                    inflight.size < concurrency &&
+                    startedCount < batchSize) {
                     const didStart = await startNextIfAny();
                     if (!didStart)
                         break;
@@ -225,7 +229,9 @@ class PriorityLockQueue {
                     // Wait for any one to settle
                     await Promise.race(Array.from(inflight));
                     // Refill slots
-                    while (!this.workerAbort && inflight.size < concurrency && startedCount < batchSize) {
+                    while (!this.workerAbort &&
+                        inflight.size < concurrency &&
+                        startedCount < batchSize) {
                         const didStart = await startNextIfAny();
                         if (!didStart)
                             break;

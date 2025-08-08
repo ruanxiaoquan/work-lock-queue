@@ -26,7 +26,12 @@ export interface EnqueuedTaskMeta {
 export class PriorityLockQueue {
   private readonly client: RedisClientType<any, any, any>;
   private readonly namespace: string;
-  private readonly keys: { pending: string; failed: string; processing: string; lock: string };
+  private readonly keys: {
+    pending: string;
+    failed: string;
+    processing: string;
+    lock: string;
+  };
   private readonly lockTtlMs: number;
   private readonly idleSleepMs: number;
   private readonly log: ConsoleLike;
@@ -59,7 +64,9 @@ export class PriorityLockQueue {
 
     const clientAsAny = this.client as any;
     if (clientAsAny && typeof clientAsAny.on === 'function') {
-      clientAsAny.on('error', (err: unknown) => this.log.error('[redis] client error', err));
+      clientAsAny.on('error', (err: unknown) =>
+        this.log.error('[redis] client error', err)
+      );
     }
 
     this.workerAbort = false;
@@ -83,7 +90,10 @@ export class PriorityLockQueue {
 
   static computeScore(priority: number, nowMs: number): number {
     const numericPriority = Number.isFinite(priority) ? Number(priority) : 5;
-    const safePriority = Math.max(0, Math.min(1000, Math.floor(numericPriority)));
+    const safePriority = Math.max(
+      0,
+      Math.min(1000, Math.floor(numericPriority))
+    );
     const PRIORITY_SCALE = 1e12;
     return safePriority * PRIORITY_SCALE + nowMs;
   }
@@ -98,7 +108,8 @@ export class PriorityLockQueue {
     const createdAtMs = Date.now();
     const score = PriorityLockQueue.computeScore(priority, createdAtMs);
 
-    const payloadString = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    const payloadString =
+      typeof payload === 'string' ? payload : JSON.stringify(payload);
 
     const taskHashKey = this.taskKey(taskId);
 
@@ -170,7 +181,12 @@ export class PriorityLockQueue {
 
   async startWorker(
     handler: (task: EnqueuedTaskMeta) => Promise<void>,
-    options: { maxAttempts?: number; renewIntervalMs?: number; batchSize?: number; concurrency?: number } = {}
+    options: {
+      maxAttempts?: number;
+      renewIntervalMs?: number;
+      batchSize?: number;
+      concurrency?: number;
+    } = {}
   ): Promise<void> {
     await this.connect();
 
@@ -218,11 +234,9 @@ export class PriorityLockQueue {
         const startNextIfAny = async () => {
           // Pop one task and start processing if available
           const popped = (await this.client.zPopMin(this.keys.pending)) as any;
-          if (!popped || popped.length === 0) {
-            return false;
-          }
-
-          const taskId = (popped[0].value ?? popped[0]) as string;
+          if (!popped) return false;
+          const raw = Array.isArray(popped) ? popped[0] : popped;
+          const taskId = typeof raw === 'string' ? raw : raw.value;
           const taskKey = this.taskKey(taskId);
           const taskData = await this.client.hGetAll(taskKey);
           if (!taskData || !(taskData as any).id) {
@@ -237,7 +251,11 @@ export class PriorityLockQueue {
             attempts: Number((taskData as any).attempts || 0),
           };
 
-          await this.client.hSet(this.keys.processing, taskId, String(Date.now()));
+          await this.client.hSet(
+            this.keys.processing,
+            taskId,
+            String(Date.now())
+          );
 
           const p = (async () => {
             try {
@@ -248,7 +266,11 @@ export class PriorityLockQueue {
               await multi.exec();
             } catch (err) {
               deserialized.attempts += 1;
-              await this.client.hSet(taskKey, 'attempts', String(deserialized.attempts));
+              await this.client.hSet(
+                taskKey,
+                'attempts',
+                String(deserialized.attempts)
+              );
 
               const failureRecord = JSON.stringify({
                 id: deserialized.id,
@@ -261,10 +283,15 @@ export class PriorityLockQueue {
               });
 
               if (deserialized.attempts < maxAttempts) {
-                const score = PriorityLockQueue.computeScore(deserialized.priority, deserialized.createdAtMs);
+                const score = PriorityLockQueue.computeScore(
+                  deserialized.priority,
+                  deserialized.createdAtMs
+                );
                 const multi = this.client.multi();
                 multi.lPush(this.keys.failed, failureRecord);
-                multi.zAdd(this.keys.pending, [{ score, value: deserialized.id }]);
+                multi.zAdd(this.keys.pending, [
+                  { score, value: deserialized.id },
+                ]);
                 multi.hDel(this.keys.processing, taskId);
                 await multi.exec();
               } else {
@@ -289,7 +316,11 @@ export class PriorityLockQueue {
         };
 
         // Fill up initial concurrency window
-        while (!this.workerAbort && inflight.size < concurrency && startedCount < batchSize) {
+        while (
+          !this.workerAbort &&
+          inflight.size < concurrency &&
+          startedCount < batchSize
+        ) {
           const didStart = await startNextIfAny();
           if (!didStart) break;
         }
@@ -300,7 +331,11 @@ export class PriorityLockQueue {
           await Promise.race(Array.from(inflight));
 
           // Refill slots
-          while (!this.workerAbort && inflight.size < concurrency && startedCount < batchSize) {
+          while (
+            !this.workerAbort &&
+            inflight.size < concurrency &&
+            startedCount < batchSize
+          ) {
             const didStart = await startNextIfAny();
             if (!didStart) break;
           }
