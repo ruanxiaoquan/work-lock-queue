@@ -1,18 +1,17 @@
-import type { RedisClientType } from 'redis';
 import { v4 as uuidv4 } from 'uuid';
+import { TairRedisClient } from '@ali/midway-tair-redis';
 
-type ConsoleLike = {
-  error: (...args: any[]) => void;
-  warn: (...args: any[]) => void;
-  log: (...args: any[]) => void;
-};
+export enum TaskPriority {
+  DEFAULT = 1,
+  MEDIUM = 2,
+  HIGH = 3,
+}
 
 export interface PriorityLockQueueOptions {
-  redisClient: RedisClientType<any, any, any>;
+  redisClient: TairRedisClient;
   namespace?: string;
   lockTtlMs?: number;
   idleSleepMs?: number;
-  log?: ConsoleLike;
 }
 
 export interface EnqueuedTaskMeta {
@@ -24,7 +23,7 @@ export interface EnqueuedTaskMeta {
 }
 
 export class PriorityLockQueue {
-  private readonly client: RedisClientType<any, any, any>;
+  private readonly client: TairRedisClient;
   private readonly namespace: string;
   private readonly keys: {
     pending: string;
@@ -34,11 +33,9 @@ export class PriorityLockQueue {
   };
   private readonly lockTtlMs: number;
   private readonly idleSleepMs: number;
-  private readonly log: ConsoleLike;
 
   private workerAbort: boolean;
   private currentLockValue: string | null;
-  private didConnectInternally: boolean;
 
   constructor(options: PriorityLockQueueOptions) {
     const {
@@ -46,7 +43,6 @@ export class PriorityLockQueue {
       namespace = 'queue',
       lockTtlMs = 30000,
       idleSleepMs = 500,
-      log = console,
     } = options;
 
     this.client = redisClient;
@@ -60,32 +56,15 @@ export class PriorityLockQueue {
 
     this.lockTtlMs = lockTtlMs;
     this.idleSleepMs = idleSleepMs;
-    this.log = log;
 
     const clientAsAny = this.client as any;
     if (clientAsAny && typeof clientAsAny.on === 'function') {
       clientAsAny.on('error', (err: unknown) =>
-        this.log.error('[redis] client error', err)
+        console.log('[redis] client error', err)
       );
     }
-
     this.workerAbort = false;
     this.currentLockValue = null;
-    this.didConnectInternally = false;
-  }
-
-  async connect(): Promise<void> {
-    if (!this.client.isOpen) {
-      await this.client.connect();
-      this.didConnectInternally = true;
-    }
-  }
-
-  async disconnect(): Promise<void> {
-    if (this.didConnectInternally) {
-      await this.client.quit();
-      this.didConnectInternally = false;
-    }
   }
 
   static computeScore(priority: number, nowMs: number): number {
@@ -102,8 +81,10 @@ export class PriorityLockQueue {
     return `${this.namespace}:task:${taskId}`;
   }
 
-  async enqueueTask(payload: unknown, priority: number = 5): Promise<string> {
-    await this.connect();
+  async enqueueTask(
+    payload: unknown,
+    priority: TaskPriority.DEFAULT
+  ): Promise<string> {
     const taskId = uuidv4();
     const createdAtMs = Date.now();
     const score = PriorityLockQueue.computeScore(priority, createdAtMs);
@@ -114,14 +95,14 @@ export class PriorityLockQueue {
     const taskHashKey = this.taskKey(taskId);
 
     const multi = this.client.multi();
-    multi.hSet(taskHashKey, {
+    multi.hset(taskHashKey, {
       id: taskId,
       payload: payloadString,
       priority: String(priority),
       createdAtMs: String(createdAtMs),
       attempts: '0',
     } as any);
-    multi.zAdd(this.keys.pending, [{ score, value: taskId }]);
+    multi.zadd(this.keys.pending, score, taskId);
     multi.expire(taskHashKey, 7 * 24 * 60 * 60);
 
     await multi.exec();
@@ -188,8 +169,6 @@ export class PriorityLockQueue {
       concurrency?: number;
     } = {}
   ): Promise<void> {
-    await this.connect();
-
     const {
       maxAttempts = 3,
       renewIntervalMs = Math.max(1000, Math.floor(this.lockTtlMs / 3)),
@@ -205,7 +184,7 @@ export class PriorityLockQueue {
           try {
             await this.renewLock();
           } catch (err) {
-            this.log.warn('[lock] renew failed', err);
+            console.log('[lock] renew failed', err);
           }
         }
         await this.sleep(renewIntervalMs);
@@ -219,7 +198,7 @@ export class PriorityLockQueue {
       try {
         hasLock = await this.acquireLock();
       } catch (err) {
-        this.log.error('[lock] acquire error', err);
+        console.log('[lock] acquire error', err);
       }
 
       if (!hasLock) {
@@ -233,12 +212,12 @@ export class PriorityLockQueue {
 
         const startNextIfAny = async () => {
           // Pop one task and start processing if available
-          const popped = (await this.client.zPopMin(this.keys.pending)) as any;
+          const popped = (await this.client.zpopmin(this.keys.pending)) as any;
           if (!popped) return false;
           const raw = Array.isArray(popped) ? popped[0] : popped;
           const taskId = typeof raw === 'string' ? raw : raw.value;
           const taskKey = this.taskKey(taskId);
-          const taskData = await this.client.hGetAll(taskKey);
+          const taskData = await this.client.hgetall(taskKey);
           if (!taskData || !(taskData as any).id) {
             return true; // consider as consumed; try to continue
           }
@@ -251,7 +230,7 @@ export class PriorityLockQueue {
             attempts: Number((taskData as any).attempts || 0),
           };
 
-          await this.client.hSet(
+          await this.client.hset(
             this.keys.processing,
             taskId,
             String(Date.now())
@@ -261,12 +240,12 @@ export class PriorityLockQueue {
             try {
               await handler(deserialized);
               const multi = this.client.multi();
-              multi.hDel(this.keys.processing, taskId);
+              multi.hdel(this.keys.processing, taskId);
               multi.del(taskKey);
               await multi.exec();
             } catch (err) {
               deserialized.attempts += 1;
-              await this.client.hSet(
+              await this.client.hset(
                 taskKey,
                 'attempts',
                 String(deserialized.attempts)
@@ -288,23 +267,21 @@ export class PriorityLockQueue {
                   deserialized.createdAtMs
                 );
                 const multi = this.client.multi();
-                multi.lPush(this.keys.failed, failureRecord);
-                multi.zAdd(this.keys.pending, [
-                  { score, value: deserialized.id },
-                ]);
-                multi.hDel(this.keys.processing, taskId);
+                multi.lpush(this.keys.failed, failureRecord);
+                multi.zadd(this.keys.pending, score, deserialized.id);
+                multi.hdel(this.keys.processing, taskId);
                 await multi.exec();
               } else {
                 const multi = this.client.multi();
-                multi.lPush(this.keys.failed, failureRecord);
-                multi.hDel(this.keys.processing, taskId);
+                multi.lpush(this.keys.failed, failureRecord);
+                multi.hdel(this.keys.processing, taskId);
                 await multi.exec();
               }
             }
           })()
             .catch((err) => {
               // Should not happen due to try/catch inside, but guard just in case
-              this.log.error('[worker] unhandled task error', err);
+              console.log('[worker] unhandled task error', err);
             })
             .finally(() => {
               inflight.delete(p);
