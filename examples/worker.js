@@ -1,9 +1,13 @@
-const { PriorityLockQueue } = require('../src');
+const { createClient } = require('redis');
+const { PriorityLockQueue } = require('../dist');
 
 (async () => {
+  const redisClient = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+  redisClient.on('error', (err) => console.error('[redis] client error', err));
+
   const queue = new PriorityLockQueue({
+    redisClient,
     namespace: process.env.QUEUE_NAMESPACE || 'demo',
-    redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
     lockTtlMs: 15000,
     idleSleepMs: 300,
   });

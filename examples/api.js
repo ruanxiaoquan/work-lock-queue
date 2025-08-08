@@ -1,12 +1,16 @@
 const express = require('express');
-const { PriorityLockQueue } = require('../src');
+const { createClient } = require('redis');
+const { PriorityLockQueue } = require('../dist');
 
 const app = express();
 app.use(express.json());
 
+const redisClient = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
+redisClient.on('error', (err) => console.error('[redis] client error', err));
+
 const queue = new PriorityLockQueue({
+  redisClient,
   namespace: process.env.QUEUE_NAMESPACE || 'demo',
-  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
 });
 
 app.post('/task', async (req, res) => {
