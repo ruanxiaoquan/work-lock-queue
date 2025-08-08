@@ -2,9 +2,11 @@
   "name": "redis-priority-lock-queue",
   "version": "1.0.0",
   "description": "Node.js Redis-based priority queue with preemptive distributed lock (setnx) and failure handling",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "type": "commonjs",
   "scripts": {
+    "build": "tsc -p tsconfig.json",
     "start:worker": "node examples/worker.js",
     "start:demo": "node examples/demo.js",
     "start:api": "node examples/api.js"
@@ -23,5 +25,9 @@
     "express": "^4.19.2",
     "redis": "^4.7.0",
     "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/uuid": "^9.0.7"
   }
 }
