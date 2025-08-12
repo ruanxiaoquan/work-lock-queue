@@ -276,8 +276,26 @@ export class QueueWorkerManager extends EventEmitter {
 
     const discovered = new Set<string>();
 
+    const scanKeysWithPattern = async (pattern: string): Promise<string[]> => {
+      const allKeys: string[] = [];
+      let cursor = '0';
+      
+      do {
+        const result = await this.redisClient!.scan(cursor, {
+          MATCH: pattern,
+          COUNT: 200
+        });
+        
+        cursor = result.cursor;
+        allKeys.push(...result.keys);
+      } while (cursor !== '0');
+      
+      return allKeys;
+    };
+
     const addFromPattern = async (pattern: string) => {
-      for await (const key of (this.redisClient as any).scanIterator({ MATCH: pattern, COUNT: 200 })) {
+      const keys = await scanKeysWithPattern(pattern);
+      for (const key of keys) {
         const k = String(key);
         if (k.endsWith(':pending')) discovered.add(k.replace(/:pending$/, ''));
         else if (k.endsWith(':processing')) discovered.add(k.replace(/:processing$/, ''));

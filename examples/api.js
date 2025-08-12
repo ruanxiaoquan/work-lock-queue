@@ -33,10 +33,17 @@ app.post('/task', async (req, res) => {
 app.get('/metrics', async (req, res) => {
   try {
     const namespaces = new Set();
-    for await (const key of redisClient.scanIterator({ MATCH: '*:pending', COUNT: 100 })) {
-      const ns = String(key).replace(/:pending$/, '');
-      namespaces.add(ns);
-    }
+    
+    // 使用 SCAN 命令替代 scanIterator
+    let cursor = '0';
+    do {
+      const result = await redisClient.scan(cursor, { MATCH: '*:pending', COUNT: 100 });
+      cursor = result.cursor;
+      for (const key of result.keys) {
+        const ns = String(key).replace(/:pending$/, '');
+        namespaces.add(ns);
+      }
+    } while (cursor !== '0');
 
     const results = [];
     for (const ns of namespaces) {
@@ -102,9 +109,14 @@ app.get(['/observe', '/observe/:namespaces'], async (req, res) => {
     } else {
       // 若未指定，则自动发现
       const discovered = new Set();
-      for await (const key of redisClient.scanIterator({ MATCH: '*:pending', COUNT: 100 })) {
-        discovered.add(String(key).replace(/:pending$/, ''));
-      }
+      let cursor = '0';
+      do {
+        const result = await redisClient.scan(cursor, { MATCH: '*:pending', COUNT: 100 });
+        cursor = result.cursor;
+        for (const key of result.keys) {
+          discovered.add(String(key).replace(/:pending$/, ''));
+        }
+      } while (cursor !== '0');
       namespaces = Array.from(discovered);
     }
 
